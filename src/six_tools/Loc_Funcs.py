@@ -237,19 +237,24 @@ def scan_data(scan,meta=None):
         data_dict = {}
         data_dict['meta'] = {}
         data_dict['data'] = {}
+        #######################################################################
+        # Preload expensive primary stream info from run
+        primary_table = run.table(stream_name="primary")
+        primary_keys = primary_table.columns
+
         #############################################################
         for motor in run.start['motors']:
-            data_dict['data'][motor] = run.table(stream_name="primary")[motor+'_user_setpoint'].to_numpy()
+            data_dict['data'][motor] = primary_table[motor+'_user_setpoint'].to_numpy()
 
         #############################################################
         # Get the data
         for detector in run.start['detectors']:
             if detector!='rixscam':
-                for i in run.table(stream_name="primary").columns:
+                for i in primary_keys:
                     if i[:len(detector)]==detector:
-                        data_dict['data'][i] = (run.table(stream_name="primary")[i].to_numpy()).astype(float) 
+                        data_dict['data'][i] = (primary_table[i].to_numpy()).astype(float) 
             else:
-                data_dict['data'][detector] = (run.table(stream_name="primary")[detector+'_xip_count_possible_event'].to_numpy()).astype(float) 
+                data_dict['data'][detector] = (primary_table[detector+'_xip_count_possible_event'].to_numpy()).astype(float) 
 
         #############################################################
         # Get the meta data
@@ -268,12 +273,17 @@ def scan_data(scan,meta=None):
                      'extslt_vg': 'slit_v', 'extslt_hg': 'slit_h', 'ring_curr': 'ring_curr'} # 'cryo_x': 'x', 'cryo_y': 'y', 'cryo_z': 'z',
 
         #######################################################################
+        # Preload expensive baseline info from run
+        baseline_table = run.table(stream_name="baseline")
+        baseline_keys = baseline_table.columns
+
+        #######################################################################
         for meta_key in (meta):
             if meta_key in run.start['motors']:
                 pass
             else:
-                if meta_key in run.table(stream_name="baseline").columns:
-                    meta_data = run.table(stream_name="baseline")[meta_key]
+                if meta_key in baseline_keys:
+                    meta_data = baseline_table[meta_key]
                     if meta_key in meta_name.keys():
                         if meta_key == 'epu1_phase_readback':
                             pol_val = meta_data.mean(axis=0)
