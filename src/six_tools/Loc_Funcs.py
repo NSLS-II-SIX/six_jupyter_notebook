@@ -3,7 +3,7 @@ import numpy as np
 from scipy import interpolate
 from scipy.signal import correlate
 from math import factorial
-# import pandas as pd
+import pandas as pd
 from pandas import concat as pd_concat
 from pandas import DataFrame as pd_df
 from prettytable import PrettyTable
@@ -17,6 +17,42 @@ from glob import glob as globf
 
 from databroker import Broker
 db = Broker.named('six')
+
+
+def structured_ragged_arrays_to_dfs(arr, invalid_val=-1.0):
+    """
+    Convert a 2D structured array to a list of DataFrames, filtering out rows
+    where *all* fields are equal to the invalid value.
+
+    This is important for rixscam_centroids, which store HDF5 files of arrays that are
+    (n_images, 4800), where each item of the 4800 is a structured array of length 8.
+    This array is padded with -1's, but the valid size is ragged.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Structured 2D array of shape (N, M), with structured dtype.
+    invalid_val : float or int
+        Sentinel value used to pad invalid entries (usually -1.0 or -1).
+
+    Returns
+    -------
+    List[pd.DataFrame]
+        One DataFrame per outer dimension (e.g., time index), with varying number
+        of rows (filtered), each with 8 columns from the dtype fields.
+    """
+    dfs = []
+    column_names = arr.dtype.names
+
+    for sub_arr in arr:
+        stacked = np.column_stack([sub_arr[field] for field in column_names])
+
+        valid_mask = ~(np.all(stacked == invalid_val, axis=1))
+
+        df = pd.DataFrame({field: sub_arr[field][valid_mask] for field in column_names})
+        dfs.append(df)
+
+    return dfs
 
 
 def six_data(scan, meta=None,E_cali=21.77):
@@ -77,10 +113,9 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
     
     #######################################################################
     # Extract the 1-D signal
-    centroids = list(header.data('rixscam_centroids'))
-    # pdframes = [centroid for centroid in centroids[0]]
-    pdframes = [sub_centroid for centroid in centroids for sub_centroid in centroid]
-    data_sheet = pd_concat([frame for frame in pdframes], ignore_index=True)  # sig in data is a pandas dataframe!
+    centroids_array = np.array(list(header.data('rixscam_centroids')))
+    pdframes = structured_ragged_arrays_to_dfs(centroids_array)
+    data_sheet = pd_concat(pdframes, ignore_index=True)
 
     data['sig_x'] = data_sheet[sig_x].to_numpy()
     data['sig_y'] = data_sheet[sig_y].to_numpy()
