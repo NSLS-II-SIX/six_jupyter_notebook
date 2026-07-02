@@ -14,12 +14,13 @@ from matplotlib import colors as mpl_color
 from ipywidgets import interactive_output as ipy_interact
 from ipywidgets import (HBox, VBox, FloatSlider, IntSlider, SelectionSlider,Layout,Button,ButtonStyle)
 from ipywidgets.widgets import Dropdown
+import ipywidgets as widgets
 
 from IPython.display import display
-from six_tools.Loc_Funcs import *
+from Loc_Funcs import *
 
 
-##############################################################################################
+""
 def m_colormap(colors, color_bin=10):
     c_array = list([])
     for i in colors:
@@ -29,7 +30,7 @@ def m_colormap(colors, color_bin=10):
     return color_map(np.linspace(0, 1, color_bin))
 
 
-##############################################################################################
+""
 def img_plot(x, y, border_line=1500, fig=None, plt_close=1):
     """Display the RIXS data as an image although x and y are one-dimensional!"""
 
@@ -76,7 +77,7 @@ def img_plot(x, y, border_line=1500, fig=None, plt_close=1):
     return ax
 
 
-##############################################################################################
+""
 def spec_plot(data, scan=None, sig='spec', xshift=0, yshift=0, fig=None, plt_close=1):
     ##############################################################
     # Sort the scan in order
@@ -147,7 +148,7 @@ def spec_plot(data, scan=None, sig='spec', xshift=0, yshift=0, fig=None, plt_clo
     
 
 
-##############################################################################################
+""
 def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
     if sample is None:
         sample = 'six'
@@ -161,11 +162,11 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
         data['six-' + str(n)] = scan_data(n, meta=meta)
         if i==0:
             for mkey in data['six-' + str(n)]['data'].keys():
-                if mkey[:4] in ['sclr','rixs','ring']:
+                if mkey[:4] in ['sclr','rixs','ring','k263']:
                     det_list_start.append(mkey)
         else:
             for mkey in data['six-' + str(n)]['data'].keys():
-                if mkey[:4] in ['sclr','rixs','ring']:
+                if mkey[:4] in ['sclr','rixs','ring','k263']:
                     det_list.append(mkey) 
             det_list_start = list(set.intersection(*map(set, [det_list_start,det_list])))
             
@@ -213,6 +214,111 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
         ax.plot(x_new, y_new/y_new[0], linestyle='--', marker='.', color=color, label=label)
 
     ############################################################################################################################
+    def view_sig_k2636b(i=0, detector = det_list_start[0],
+                        save='No', disp_type='single'):
+        ax1.clear()
+        ax2.clear()
+        ##############################################################
+        # check the motor size to determine the plot type
+        motor = list(data['six-' + str(scan[i])]['motor'].keys())
+        motor_size = len(motor)
+        print('Loaded Keithley measurement')
+        xlim_low, xlim_high = np.array([]), np.array([])
+
+        if disp_type == 'single':
+            if motor_size==1:
+                motor_local = motor
+                x_original = data['six-' + str(scan[i])]['motor'][motor_local[0]]
+                y_original = data['six-' + str(scan[i])]['data'][detector]
+    
+                if len(x_original)!=len(y_original):
+                    x = x_original[:int(min(len(x_original),len(y_original)))]
+                    y = y_original[:int(min(len(x_original),len(y_original)))]
+                else:
+                    x,y = x_original,y_original
+    
+                xlim_low = np.append(xlim_low, x.min())
+                xlim_high = np.append(xlim_high, x.max())
+    
+                sig_plot(x, y, ax=ax1, color=colors[i, :], label='six-' + str(scan[i]))
+
+                sig_plot(x, y, ax=ax2, color=colors[i, :], label='six-' + str(scan[i]))
+    
+                # ax1.set_xlim(xlim_low.min()-1,xlim_high.max()+1)
+                ax1.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
+                ax1.axes.grid(color='k', linestyle='--', linewidth=1, alpha=0.3)
+                ax1.set_xlabel(motor_local[0], fontdict={'size': 15})
+                ax1.set_ylabel(f'{detector}/arbi.', fontdict={'size': 15})
+                ax1.legend()
+    
+                ax2.axes.grid(color='k', linestyle='--', linewidth=1, alpha=0.3)
+                ax2.set_xlabel(motor_local[0], fontdict={'size': 15})
+                ax2.set_ylabel(f'{detector}/arbi.', fontdict={'size': 15})
+                ax2.legend()
+    
+                # print(data['six-' + str(scan[i])].keys())
+                # print(data['six-' + str(scan[i])]['data'].keys())
+                # print(data['six-' + str(scan[i])]['meta'].keys())
+            else:
+                print('Unable to handle the data collected by moving multiple (>2) motors!!!')
+        else:
+            if motor_size==1:
+                for n in range(0, i + 1, 1):   
+                    motor_local = motor
+                    x_original = data['six-' + str(scan[n])]['motor'][motor_local[0]]
+                    y_original = data['six-' + str(scan[n])]['data'][detector]
+
+                    if len(x_original)!=len(y_original):
+                        x = x_original[:int(min(len(x_original),len(y_original)))]
+                        y = y_original[:int(min(len(x_original),len(y_original)))]
+                    else:
+                        x,y = x_original,y_original
+
+                    xlim_low = np.append(xlim_low, x.min())
+                    xlim_high = np.append(xlim_high, x.max())
+
+                    sig_plot(x, y, ax=ax1, color=colors[n, :], label='six-' + str(scan[n]))
+                    
+                    sig_plot(x, y, ax=ax2, color=colors[n, :], label='six-' + str(scan[n]))
+                
+                # ax1.set_xlim(xlim_low.min()-1,xlim_high.max()+1)
+                ax1.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
+                ax1.axes.grid(color='k', linestyle='--', linewidth=1, alpha=0.3)
+                ax1.set_xlabel(motor_local[0], fontdict={'size': 15})
+                ax1.set_ylabel(f'{detector}/arbi.', fontdict={'size': 15})
+                ax1.legend()
+
+                ax2.axes.grid(color='k', linestyle='--', linewidth=1, alpha=0.3)
+                ax2.set_xlabel(motor_local[0], fontdict={'size': 15})
+                ax2.set_ylabel(f'{detector}/arbi.', fontdict={'size': 15})
+                ax2.legend()
+            
+            else:
+                print('Can not display multiple images on one plot!!!')
+                
+        if save == 'No':
+            pass
+        elif save == 'hdf':
+            save_folder = cwd + '/Data/'
+            if disp_type == 'single':
+                save_scan(data, save_folder, data_format='hdf', scan=scan[i], sample=sample)
+                print('Data has been saved into HDF files!!!')
+            else:
+                save_scan(data, save_folder, data_format='hdf', sample=sample)
+                print('All data has been saved into HDF files!!!')
+        else:
+            save_folder = cwd + '/Data/'
+            if disp_type == 'single':
+                save_scan(data, save_folder, data_format='txt', scan=scan[i], sample=sample)
+                print('Data has been saved into TXT files!!!')
+            else:
+                save_scan(data, save_folder, data_format='txt',sample=sample)
+                print('All data has been saved into TXT files!!!')
+        ##############################################################
+        
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+        ##############################################################
     def view_sig(i=0, detector='sclr_channels_chan2',
                  norm='No',norm_chan='sclr_channels_chan8', 
                  save='No', disp_type='single'):
@@ -220,11 +326,11 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
         ax2.clear()
         ##############################################################
         # check the motor size to determine the plot type
-        motor = []
-        for mkey in data['six-' + str(scan[i])]['data'].keys():
-            if mkey[:4] not in ['sclr','rixs','ring']:
-                motor.append(mkey)
-                
+        # motor = []
+        # for mkey in data['six-' + str(scan[i])]['data'].keys():
+        #     if mkey[:4] not in ['sclr','rixs','ring']:
+        #         motor.append(mkey)
+        motor = list(data['six-' + str(scan[i])]['motor'].keys())        
         motor_size = len(motor)
         ##############################################################
         # Set-up the data normalization
@@ -236,7 +342,7 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
             else:
                 print('Invalid norm opition, only Yes or No!!!')
             for mkey in det_list_start:
-                if mkey[:4] in ['sclr','rixs','ring']:
+                if mkey[:4] in ['sclr','rixs','ring','k263']:
                     if mkey!=norm_chan:
                         data['six-' + str(t)]['data'][mkey+'_norm'] = data['six-' + str(t)]['data'][mkey]/ (norm_f / np.ravel(norm_f)[0])
                     else:
@@ -251,8 +357,9 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
         if disp_type == 'single':
             
             if motor_size==1:
-                motor_local = [p for p in data['six-' + str(scan[i])]['data'].keys() if p[:4]!=['sclr','rixs','ring']]
-                x_original = data['six-' + str(scan[i])]['data'][motor_local[0]]
+                # motor_local = [p for p in data['six-' + str(scan[i])]['data'].keys() if p[:4]!=['sclr','rixs','ring']]
+                motor_local = list(data['six-' + str(scan[i])]['motor'].keys())    
+                x_original = data['six-' + str(scan[i])]['motor'][motor_local[0]]
                 try:
                     y_original = data['six-' + str(scan[i])]['data'][detector+'_norm']
                 except:
@@ -288,13 +395,11 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
                 # print(data['six-' + str(scan[i])]['data'].keys())
                 # print(data['six-' + str(scan[i])]['meta'].keys())
             elif motor_size==2:
-                motor_local = [p for p in data['six-' + str(scan[i])]['data'].keys() if p[:4]!=['sclr','rixs','ring']]
-                x_original = data['six-' + str(scan[i])]['data'][motor_local[0]]
-                y_original = data['six-' + str(scan[i])]['data'][motor_local[1]]
-                
-               
-                
-                
+                # motor_local = [p for p in data['six-' + str(scan[i])]['data'].keys() if p[:4]!=['sclr','rixs','ring']]
+                motor_local = list(data['six-' + str(scan[i])]['motor'].keys())    
+                x_original = data['six-' + str(scan[i])]['motor'][motor_local[0]]
+                y_original = data['six-' + str(scan[i])]['motor'][motor_local[1]]
+
                 try:
                     z_original = data['six-' + str(scan[i])]['data'][detector+'_norm'] 
                 except:
@@ -333,11 +438,11 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
             if motor_size==1:
                 motor_local_list = []
                 for n in range(0, i + 1, 1):
-                    
-                    motor_local = [p for p in data['six-' + str(scan[n])]['data'].keys() if p[:4]!=['sclr','rixs','ring']]
+                    # motor_local = [p for p in data['six-' + str(scan[n])]['data'].keys() if p[:4]!=['sclr','rixs','ring']]
+                    motor_local = list(data['six-' + str(scan[i])]['motor'].keys())    
                     motor_local_list.append(motor_local[0])
                 
-                    x_original = data['six-' + str(scan[n])]['data'][motor_local[0]]
+                    x_original = data['six-' + str(scan[n])]['motor'][motor_local[0]]
                     
                     try:
                         y_original = data['six-' + str(scan[n])]['data'][detector+'_norm']
@@ -405,29 +510,43 @@ def scan_plot(scan, sample=None, meta=None, fig=None, plt_close=1):
     ####################################################################################################################
     i_s = IntSlider(min=0, max=len(scan) - 1, step=1, value=0, description='i')
     i_s.style.handle_color = 'black'
-    
-    detector_s = Dropdown(options=[(k,k) for k in det_list_start], value='sclr_channels_chan2', description='detector')
+
+    if det_list_start[0][:4]=='k263':
+        detector_s = Dropdown(options=[(k,k) for k in det_list_start], description='detector')
+    else:
+        detector_s = Dropdown(options=[(k,k) for k in det_list_start], value='sclr_channels_chan2', description='detector')
 
     
-
-    norm_s = Dropdown(options=[('No', 'No'), ('Yes', 'Yes')], value='No', description='norm')
-    norm_chan_s = Dropdown(options=[(k,k) for k in det_list_start if k[:4]!='rixs'], value='sclr_channels_chan8', description='norm_chan')
-    
+    if det_list_start[0][:4]!='k263':
+        norm_s = Dropdown(options=[('No', 'No'), ('Yes', 'Yes')], value='No', description='norm')
+        norm_chan_s = Dropdown(options=[(k,k) for k in det_list_start if k[:4]!='rixs'], value='sclr_channels_chan8', description='norm_chan')
+    else:
+        pass
     
     save_s = Dropdown(options=[('Yes_hdf', 'hdf'), ('Yes_txt', 'txt'), ('No', 'No')], value='No', description='save!!!')
     disp_type_s = Dropdown(options=[('single', 'single'), ('multiple', 'multiple')], value='single',
                            description='disp_type')
-
-    mwidget = ipy_interact(view_sig,
-                           {'i': i_s, 'detector':detector_s,
-                            'norm': norm_s,'norm_chan': norm_chan_s, 
-                            'save': save_s, 'disp_type': disp_type_s})
+    if det_list_start[0][:4]!='k263':
+        mwidget = ipy_interact(view_sig,
+                               {'i': i_s, 'detector':detector_s,
+                                'norm': norm_s,'norm_chan': norm_chan_s, 
+                                'save': save_s, 'disp_type': disp_type_s})
+    else:
+        mwidget = ipy_interact(view_sig_k2636b,
+                               {'i': i_s, 'detector':detector_s,
+                                'save': save_s, 'disp_type': disp_type_s})
 
     left_box = VBox([detector_s,i_s])
-    center_box = VBox([norm_s,norm_chan_s])
+    if det_list_start[0][:4]!='k263':
+        center_box = VBox([norm_s,norm_chan_s])
+    else:
+        pass
     right_box = VBox([disp_type_s, save_s])
-    display(HBox([left_box, center_box,right_box]), mwidget)  # Show all controls
-##############################################################################################
+    if det_list_start[0][:4]!='k263':
+        display(HBox([left_box, center_box,right_box]), mwidget)  # Show all controls
+    else:
+        display(HBox([left_box,right_box]), mwidget)  # Show all controls
+""
 def raw_sig(raw_data, *sig_roi, scan=None, fig=None, plt_close=1):
     """Check all data signal and beamline status!"""
 
@@ -662,7 +781,7 @@ def raw_sig(raw_data, *sig_roi, scan=None, fig=None, plt_close=1):
     return data
 
 
-##############################################################################################
+""
 def check_slope(data, scan=None, slope_l=None, slope_r=None, fig=None, plt_close=1):
     ##############################################################
     # Sort the scan in order
@@ -781,7 +900,7 @@ def check_slope(data, scan=None, slope_l=None, slope_r=None, fig=None, plt_close
     return {'slope_l': slope_l_s, 'slope_r': slope_r_s}
 
 
-##############################################################################################
+""
 def stat_plot(data, scan=None,slope_l=None, slope_r=None, xshift=0, yshift=0, fig=None, plt_close=1):
     ##############################################################
     # Sort the scan in order
@@ -897,7 +1016,7 @@ def stat_plot(data, scan=None,slope_l=None, slope_r=None, xshift=0, yshift=0, fi
     return {'points_per_pixel_cor': points_per_pixel_s}
 
 
-##############################################################################################
+""
 def check_spec_shift(raw_data, scan=None, 
              border=1500, slope_l=0, slope_r=0, points_per_pixel=1,
              cor_roi_l=None, cor_roi_r=None, cor_interp=0, shift_type=None,
@@ -1059,10 +1178,10 @@ def check_spec_shift(raw_data, scan=None,
     display(HBox([left_box, center_box, right_box]), mwidget)  # Show all controls
 
     
+
     
-    
-    
-##############################################################################################
+
+""
 def check_cor(data, scan=None,
               slope_l=0, slope_r=0, points_per_pixel=1,
               cor_roi=None,
@@ -1308,7 +1427,7 @@ def check_cor(data, scan=None,
 
 
 
-##############################################################################################
+""
 def spec_cor(data, scan=None, sample=None,
              slope_l=0, slope_r=0, points_per_pixel=1,
              cor_roi_l=None, cor_roi_r=None, cor_interp=0, shift_type='self',
@@ -1585,6 +1704,7 @@ def spec_cor(data, scan=None, sample=None,
     y_shift_s = FloatSlider(min=0, max=5, step=0.05, value=0, description='y_shift')
     save_s = Dropdown(options=[('Yes_hdf', 'hdf'), ('Yes_txt', 'txt'), ('No', 'No')], value='No', description='save!!!')
 
+    
     mwidget = ipy_interact(view_sig,
                            {'E_cor_low': E_cor_low_s, 'E_cor_high': E_cor_high_s, 'cor_interp_E': cor_interp_E_s,
                             'E_low': E_low_s, 'E_high': E_high_s,
@@ -1608,21 +1728,27 @@ def spec_cor(data, scan=None, sample=None,
         border='solid 2px',
         align_items='stretch'))
 
+    save_all_button = Button(description='Save All points_per_pixel (Click)', layout=Layout(width='auto', grid_area='header'),
+                                 style=ButtonStyle(button_color='bisque'))
+    save_all_button.on_click(lambda x: save_all())
+    
     right_but = Button(description='Save Data',layout=Layout(width='auto', grid_area='header'),
                       style=ButtonStyle(button_color='bisque'))
-    right_box = VBox([right_but,points_per_pixel_spec_s, save_s],layout=Layout(
+    right_box = VBox([right_but,points_per_pixel_spec_s, save_all_button, save_s],layout=Layout(
         width='auto',
         flex_flow='column',
         border='solid 2px',
         align_items='stretch'))
-
+    
     display(HBox([left_box, center_box, right_box]), mwidget)  # Show all controls
 
+    def save_all():
+        for points_per_pixel_spec in points_per_pixel_spec_value:
+            view_sig(E_cor_low=E_cor_low_s.value, E_cor_high=E_cor_high_s.value, cor_interp_E=cor_interp_E_s.value, E_low=E_low_s.value, 
+                     E_high=E_high_s.value,points_per_pixel_spec=points_per_pixel_spec,points_per_pixel_shift=points_per_pixel_shift_s.value,E_shift=E_shift_s.value, y_shift=y_shift_s.value, save='hdf')
 
 
-
-
-############################################################################################################################
+""
 def sensor_shift(data, scan, sensor, xshift_dict, shift_type, shift_roi,cor_interp):
     data_total = {}
     #####################################################################################
@@ -1683,8 +1809,7 @@ def sensor_shift(data, scan, sensor, xshift_dict, shift_type, shift_roi,cor_inte
             xshift_array = np.append(xshift_array, xshift)
 
     return xshift_array
-##############################################################################################
-
+""
 def shift_dict(data, scan=None, slope_l=0, slope_r=0, points_per_pixel=1,
                cor_roi_l=0, cor_roi_r=400, cor_interp=0):
     if scan is None:
@@ -1728,7 +1853,7 @@ def shift_dict(data, scan=None, slope_l=0, slope_r=0, points_per_pixel=1,
 
 
 
-##############################################################################################
+""
 def rixs1d(data_folder, scan, sample=None, data_type='hdf', fig=None, plt_close=1):
     if sample is None:
         sample = 'six'
@@ -1899,7 +2024,7 @@ def rixs1d(data_folder, scan, sample=None, data_type='hdf', fig=None, plt_close=
     display(HBox([center_box1, right_box, left_box]), mwidget)  # Show all controls
 
 
-##############################################################################################
+""
 def rixs2d(data_folder, scan, sample=None, sig='rixs', vari='th', vari_offset=0,
            cut_type='V', colormap='jet', fig=None, plt_close=1):
     ##############################################################
@@ -2226,10 +2351,10 @@ def rixs2d(data_folder, scan, sample=None, sig='rixs', vari='th', vari_offset=0,
     right_box = VBox([sig_s, E_shift_s, cut_s, cut_int_wid_s])
 
     display(HBox([left_box, right_box, center_box2]), mwidget)  # Show all controls
+
     
-    
-    
-##############################################################################################
+
+""
 def meta_plot(data_folder, scan, sample=None, meta='th',fig=None, plt_close=1):
     scan_sort = np.sort(scan)
     ##############################################################
@@ -2281,4 +2406,4 @@ def meta_plot(data_folder, scan, sample=None, meta='th',fig=None, plt_close=1):
     ax.grid(linestyle='-.')
     ax.set_xlabel('scan No.',fontdict={'size': 15})
     ax.set_ylabel(meta,fontdict={'size': 15})
-    
+
