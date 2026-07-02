@@ -3,7 +3,7 @@ import numpy as np
 from scipy import interpolate
 from scipy.signal import correlate
 from math import factorial
-# import pandas as pd
+import pandas as pd
 from pandas import concat as pd_concat
 from pandas import DataFrame as pd_df
 from prettytable import PrettyTable
@@ -11,6 +11,9 @@ from time import (time, ctime)
 from h5py import File as h5_file
 from h5py import special_dtype
 from glob import glob as globf
+import h5py
+from numpy.lib import recfunctions as rfn
+from pathlib import Path
 ###############################################
 # from databroker import DataBroker
 # db = DataBroker.named('six')
@@ -18,6 +21,184 @@ from glob import glob as globf
 from databroker import Broker
 db = Broker.named('six')
 
+
+####### May 21, 2026 -- Thomas Hopkins wrote codes for loading corrupted RIXS scans #####################
+columns = ("x", "y", "x_eta", "y_eta", "y_eta_iso", "sum_regions", "XIP mode")
+dtype_list = [(name, "<f4") for name in columns] + [("frame", "<i2")]
+dtype = np.dtype(dtype_list)
+LENGTH = 4800  # twice the longest we have seen (increased from 2400 in March 2023)
+
+from tiled.client import from_uri
+tiled_client = from_uri("https://tiled.nsls2.bnl.gov/")["six/raw"]
+
+class Handler:
+    """
+    Adapted from sixtools.AD_Handler:AreaDetector_HDF5SingleHandler_DataFrame
+
+    Handler for hdf5 data stored 1 image per file and returned as a
+    Pandas.DataFrame.
+
+    This will work with all hdf5 files that are a mxn arrays and the data is
+    'table like' where m is the number of columns and n is the number of rows.
+
+    Parameters
+    ----------
+    fpath : string
+        filepath
+    template : string
+        filename template string.
+    filename : string
+        filename
+    key : string
+        the 'path' inside the file to the data set.
+    column_names : list[str]
+        The column names of the table
+    frame_per_point : float
+        the number of frames per point.
+    """
+
+    def __init__(
+        self,
+        fpath,
+        template,
+        filename,
+        key="/entry/data/data",
+        column_names=None,
+        frame_per_point=1,
+    ):
+        # I have included defaults for `key` and 'column_names' for back
+        # compatibility with existing files at SIX.
+        self._path = os.path.join(fpath, "")
+        self._fpp = frame_per_point
+        self._template = template
+        self._filename = filename
+        self._key = key
+        self._column_names = column_names
+
+    def _fnames_for_point(self, point_number):
+        start = int(point_number * self._fpp)
+        stop = int((point_number + 1) * self._fpp)
+        for j in range(start, stop):
+            yield self._template % (self._path, self._filename, j)
+
+    def __call__(self, point_number):
+        dfs = []
+        import h5py
+        errorcount = 0
+        for i, fn in enumerate(self._fnames_for_point(point_number)):
+            try:
+                with h5py.File(fn, "r") as f:
+                    dataframe = pd.DataFrame(
+                        f[self._key][:], columns=self._column_names
+                    )
+                    dataframe["frame"] = i
+            except OSError as e:
+                print(
+                    f"Caught exception: {repr(e)}\n"
+                    f"Path: {fn}\n"
+                    f"Index: {point_number}\n"
+                    "Filling in `0` values for this frame!"
+                )
+                dataframe = pd.DataFrame(columns=self._column_names)
+                dataframe.loc[0] = 0
+                errorcount += 1
+                # dataframe.loc[0] = np.nan
+                dataframe["frame"] = i
+            dfs.append(dataframe)
+        arr = np.empty(LENGTH, dtype=dtype)
+        arr.fill(-1)  # 'frame' of -1 is our sentinel for "padding"
+        records = pd.concat(dfs).to_records(
+            column_dtypes={name: dtype for name, dtype in dtype_list}, index=False
+        )
+        assert records.dtype == arr.dtype
+        arr[: len(records)] = records
+        return arr, errorcount
+
+    def get_file_list(self, datum_kwargs):
+        ret = []
+        for d_kw in datum_kwargs:
+            ret.extend(self._fnames_for_point(**d_kw))
+        return ret
+
+def load_centroids_data_frame(tiled_client, uid: str) -> pd.DataFrame:
+    documents = list(tiled_client[uid].documents())
+
+    # Get the XIP resource document
+    resource_doc = None
+    for doc in documents:
+        if doc[0] == "resource" and doc[1]["spec"] == "AD_HDF5_SINGLE_XIP":
+            resource_doc = doc[1]
+    if resource_doc is None:
+        raise RuntimeError(
+            f"Could not find 'resource' document that references RIXScam XIP centroids from run: {uid}"
+        )
+
+    # Get datum docs
+    min_point_num = 1_000_000_000
+    max_point_num = 0
+    for doc in documents:
+        if doc[0] == "datum_page" and doc[1]["resource"] == resource_doc["uid"]:
+            point_number = doc[1]["datum_kwargs"]["point_number"][0]
+            min_point_num = min(min_point_num, point_number)
+            max_point_num = max(max_point_num, point_number)
+
+    fpath = Path(resource_doc["root"]) / Path(resource_doc["resource_path"])
+    handler = Handler(
+        str(fpath),
+        **resource_doc["resource_kwargs"],
+    )
+    arr_s = []
+    errorcount = 0
+    for pn in range(min_point_num, max_point_num + 1):
+        h = handler(pn)
+        arr_s.append(h[0])
+        errorcount += h[1]
+    arr = np.vstack(arr_s)
+    # arr = np.stack([handler(pn) for pn in range(min_point_num, max_point_num + 1)])
+    # for field in void_element.dtype.names:
+    # # Only check fields that can actually contain NaN (floats or complex)
+    # if np.issubdtype(void_element.dtype[field], np.inexact):
+    #     if np.isnan(void_element[field]).any():
+    #         void_element[field] = np.nan_to_num(void_element[field])
+            
+    return arr, errorcount
+
+###########################################################################################################################
+
+def structured_ragged_arrays_to_dfs(arr, invalid_val = -1.0):
+    """
+    Convert a 2D structured array to a list of DataFrames, filtering out rows
+    where *all* fields are equal to the invalid value.
+
+    This is imporant for rixscam_centroids, which store HDF5 files of arrays that are
+    (n_images, 4800), where each item of the 4800 is a structured array of length 8.
+    This array is padded with -1's, but the valid size is ragged.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Structured 2D array of shape (N, M), with structured dtype.
+    invalid_val : float or int
+        Sentinel value used to pad invalid entries (usually -1.0 or -1).
+
+    Returns
+    -------
+    List[pd.DataFrame]
+        One DataFrame per outer dimension (e.g., time index), with varying number
+        of rows (filtered), each with 8 columns from the dtype fields.
+    """
+    dfs = []
+    column_names = arr.dtype.names
+
+    for sub_arr in arr:
+        stacked = np.column_stack([sub_arr[field] for field in column_names])
+
+        valid_mask = ~(np.all(stacked == invalid_val, axis=1))
+
+        df = pd.DataFrame({field: sub_arr[field][valid_mask] for field in column_names})
+        dfs.append(df)
+    
+    return dfs
 
 def six_data(scan, meta=None,E_cali=21.77):
     if meta is None:
@@ -44,7 +225,7 @@ def six_data(scan, meta=None,E_cali=21.77):
     return data
 
 
-##############################################################################################
+""
 def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
     """This is for extracting the RIXS data from BNL online drive """
     """The result is a dict containing the 1-dimensional signal and interesting beamline parameters"""
@@ -77,10 +258,16 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
     
     #######################################################################
     # Extract the 1-D signal
-    centroids = list(header.data('rixscam_centroids'))
-    # pdframes = [centroid for centroid in centroids[0]]
-    pdframes = [sub_centroid for centroid in centroids for sub_centroid in centroid]
-    data_sheet = pd_concat([frame for frame in pdframes], ignore_index=True)  # sig in data is a pandas dataframe!
+    # centroids = list(header.data('rixscam_centroids'))
+    # # pdframes = [centroid for centroid in centroids[0]]
+    # pdframes = [sub_centroid for centroid in centroids for sub_centroid in centroid]
+    # data_sheet = pd_concat([frame for frame in pdframes], ignore_index=True)  # sig in data is a pandas dataframe!
+
+    # centroids_array = np.array(list(header.data('rixscam_centroids')))
+    centroids_array, num_corrupted_images = load_centroids_data_frame(tiled_client,int(scan))
+    # num_corrupted_images = np.array([np.isnan(centroids_array[i][0][0]) for i in range(centroids_array.shape[0])]).sum()
+    pdframes = structured_ragged_arrays_to_dfs(centroids_array)
+    data_sheet = pd_concat(pdframes, ignore_index=True)
 
     data['sig_x'] = data_sheet[sig_x].to_numpy()
     data['sig_y'] = data_sheet[sig_y].to_numpy()
@@ -118,9 +305,11 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
 
     # Specific the counting time for this scan
     data['image_time'] = header.config_data('rixscam')['primary'][0].get('rixscam_cam_acquire_time')  # expose time (seconds) for one image
-    data['image_num'] = len(pdframes)  # Number of images in this scan
+    data['image_num'] = len(pdframes)-num_corrupted_images  # Number of images in this scan
     data['count_time'] = data['image_time'] * data['image_num']  # Total counting time in seconds
-    data['total_time'] = (header['stop'].get('time', time()) - header['start']['time'])  # Duration time (s) for the whole scan
+    # data['total_time'] = (header['stop'].get('time', time()) - header['start']['time'])  # Duration time (s) for the whole scan
+    data_timestamp = header.table()['time'].to_numpy() # unit: nano sec (1e-9 sec)
+    data['total_time'] = float((data_timestamp[-1]-data_timestamp[0])/np.timedelta64(1,'s')) # Duration time (s) for the whole scan
 
     # Get the I0 for normalization
     try:
@@ -139,6 +328,156 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
 
     return data
 
+# def six_data_corrupted(scan, corr_scan, date, filepath, filename, index, meta=None,E_cali=21.77):
+#     if meta is None:
+#         meta = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','oc_twoth','epu1_gap_readback',
+#                          'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
+#     else:
+#         meta_ = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','oc_twoth','epu1_gap_readback',
+#                           'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
+#         meta = np.unique(np.hstack((meta, meta_)))        
+#     data = {}
+#     for i,n in enumerate(scan):
+#         if n not in corr_scan:
+#             data['six-' + str(n)] = rixs_data(n, meta=meta)
+#         else:
+#             data['six-' + str(n)] = rixs_data_corrupted(n, date, filepath, filename, index, meta=meta)
+#             print(f"Corrupted RIXS scan:{n}, Apr. {date:02d}")
+#         ################################################
+#         # Correct the pixel shift due to different incident photon energies
+#         data['six-' + str(n)]['E_cali'] = E_cali
+#         if i==0:
+#             energy_ref = data['six-' + str(n)]['energy']
+#         energy_offset = (data['six-' + str(n)]['energy'] - energy_ref)*1000 # in the unit of meV
+#         if np.abs(energy_offset)>100.0:
+#             data['six-' + str(n)]['sig_y']+=(energy_offset/E_cali)
+#         else:
+#             pass
+#     #################################################################### 
+#     return data
+
+
+# ""
+# def rixs_data_corrupted(scan, date, filepath, filename, index, sig_x='x_eta', sig_y='y_eta', meta=None):
+#     """This is for extracting the RIXS data from BNL online drive """
+#     """The result is a dict containing the 1-dimensional signal and interesting beamline parameters"""
+#     """The version of reading rixs_scan that is corrupted -- 0 Byte file included"""
+#     # sig_x and sig_y characterize the signal type (COM or corrected COM) provided by (Xcam) detector.
+#     # They can be x or x_eta, y or y_eta.
+    
+#     # meta is a array to initialize the beamline parameters for this scan    
+    
+#     header = db[int(scan)]
+#     data = {}
+
+#     # Initialize the keys for meta data
+#     if meta is None:
+#         meta = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','pgm_cff','oc_twoth','epu1_gap_readback',
+#                          'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
+#     else:
+#         meta_ = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','oc_twoth', 'epu1_gap_readback',
+#                           'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
+#         meta = np.unique(np.hstack((meta, meta_)))
+#     meta_name = {'cryo_x': 'x', 'cryo_y': 'y', 'cryo_z': 'z', 'cryo_t': 'th', 'pgm_en': 'energy',
+#                  'stemp_temp_B_T': 'T','stemp_temp_A_T':'T_cryo',
+#                  'epu1_phase_readback': 'pol','epu1_gap_readback': 'pol_gap','pgm_cff':'cff','oc_twoth': 'tth', 
+#                  'extslt_vg': 'slit_v', 'extslt_hg': 'slit_h', 'ring_curr': 'ring_curr'} # 
+
+#     #######################################################################
+#     # get the image dimensions
+#     img_size_x = int(header.config_data('rixscam')['primary'][0].get('rixscam_sensor_region_xsize')*2)
+#     img_size_y = int(header.config_data('rixscam')['primary'][0].get('rixscam_sensor_region_ysize'))
+#     data['image_size'] = np.array([img_size_x,img_size_y])
+    
+#     #######################################################################
+#     # Extract the 1-D signal
+#     # centroids = list(header.data('rixscam_centroids'))
+#     # # pdframes = [centroid for centroid in centroids[0]]
+#     # pdframes = [sub_centroid for centroid in centroids for sub_centroid in centroid]
+#     # data_sheet = pd_concat([frame for frame in pdframes], ignore_index=True)  # sig in data is a pandas dataframe!
+
+#     # centroids_array = np.array(list(header.data('rixscam_centroids')))
+#     # pdframes = structured_ragged_arrays_to_dfs(centroids_array)
+#     # data_sheet = pd_concat(pdframes, ignore_index=True)
+
+#     dirpath = filepath+f'{date:02d}/'
+    
+#     # Match any file containing "partial" in its name
+#     files = Path(dirpath).glob(f'{filename}*.h5')
+#     fpaths = sorted([f.name for f in files if f.is_file()])
+#     for i in sorted(index, reverse=True):
+#         del fpaths[i]
+        
+#     dt = np.dtype([('x', '<f4'), ('y', '<f4'), ('x_eta', '<f4'), ('y_eta', '<f4'),
+#                    ('y_eta_iso', '<f4'), ('sum_regions', '<f4'), ('XIP mode', '<f4'), ('frame', '<i2')])
+#     centroids_array = []
+#     for fp in fpaths:
+#         a = h5py.File(dirpath+fp)['/entry/data/data'][()]
+#         b = np.hstack((a,np.zeros((a.shape[0],1))))
+#         structured_arrs = rfn.unstructured_to_structured(b, dtype=dt)
+#         centroids_array.append(structured_arrs)
+    
+#     pdframes = [pd.DataFrame(centroids_array_each) for centroids_array_each in centroids_array]
+#     data_sheet = pd_concat(pdframes, ignore_index=True)
+
+#     data['sig_x'] = data_sheet[sig_x].to_numpy()
+#     data['sig_y'] = data_sheet[sig_y].to_numpy()
+
+#     #######################################################################
+#     # shift the signal from right sensor by -26 pixels
+#     data['sig_y'][data['sig_x']>(img_size_x/2)]-=26
+#     #######################################################################
+#     meta_list = []
+#     for i in db.get_table(header, stream_name="baseline").columns:
+#         meta_list.append(i)
+        
+#     # Extract the meta-data
+#     for key in (meta):
+#         if key in meta_list:
+#             vari = db.get_table(header, stream_name="baseline", fields=[key])[key]
+#             if key in meta_name.keys():
+#                 if key == 'epu1_phase_readback':
+#                     pol_val = vari.mean(axis=0)
+#                     if np.abs(pol_val - 0) < (1e-2):
+#                         data[meta_name[key]] = 'LH'
+#                     elif np.abs(pol_val - 28.5) < (1e-2):
+#                         data[meta_name[key]] = 'LV'
+#                     else:
+#                         data[meta_name[key]] = vari.mean(axis=0)
+#                 else:
+#                     data[meta_name[key]] = vari.mean(axis=0)
+#             else:
+#                 data[key] = vari.mean(axis=0)
+#         else:
+#             if key in meta_name.keys():
+#                 data[meta_name[key]] = 'N/A'
+#             else:
+#                 data[key] = 'N/A'
+
+#     # Specific the counting time for this scan
+#     data['image_time'] = header.config_data('rixscam')['primary'][0].get('rixscam_cam_acquire_time')  # expose time (seconds) for one image
+#     data['image_num'] = len(pdframes)  # Number of images in this scan
+#     data['count_time'] = data['image_time'] * data['image_num']  # Total counting time in seconds
+#     # data['total_time'] = (header['stop'].get('time', time()) - header['start']['time'])  # Duration time (s) for the whole scan
+#     data_timestamp = header.table()['time'].to_numpy() # unit: nano sec (1e-9 sec)
+#     data['total_time'] = float((data_timestamp[-1]-data_timestamp[0])/np.timedelta64(1,'s')) # Duration time (s) for the whole scan
+
+#     # Get the I0 for normalization
+#     try:
+#         I_0 = (db.get_table(header)['sclr_channels_chan8']).to_numpy()
+#         data['norm_I0'] = np.delete(I_0, np.where(I_0 <= ((I_0.max() + I_0.mean()) / 2))).mean()
+#     except:
+#         data['norm_I0'] = 1.0
+#     data['norm_I0']/=data['image_time']
+        
+#     scan_start_time = ctime(header['start']['time'])
+
+#     # Print out the details for each scan
+#     print('--- six-{} --- points {} --- '.format(scan, data['image_num']), end='')
+#     print('split time {}s --- total {}s '.format(data['image_time'], data['count_time']), end='')
+#     print('--- duration {:.1f}s --- when {}'.format(data['total_time'], scan_start_time))
+
+#     return data
 
 def print_data(data, scan=None):
     data_table = PrettyTable()
@@ -159,7 +498,7 @@ def print_data(data, scan=None):
     print(data_table)
 
 
-##############################################################################################
+""
 def scan_info(data_folder, scan, disp=None, sample=None):
     if sample is None:
         sample = 'six'
@@ -237,9 +576,15 @@ def scan_data(scan,meta=None):
         data_dict = {}
         data_dict['meta'] = {}
         data_dict['data'] = {}
+        data_dict['motor'] = {}
         #############################################################
         for motor in run.start['motors']:
-            data_dict['data'][motor] = run.table(stream_name="primary")[motor+'_user_setpoint'].to_numpy()
+            if motor[:6]=='k2636b':
+                setp = '_setpoint'
+            else:
+                setp = '_user_setpoint'
+            data_dict['data'][motor] = run.table(stream_name="primary")[motor+setp].to_numpy()
+            data_dict['motor'][motor] = run.table(stream_name="primary")[motor+setp].to_numpy()
 
         #############################################################
         # Get the data
@@ -294,8 +639,8 @@ def scan_data(scan,meta=None):
     
     
     
-    
-##############################################################################################
+
+""
 def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
     
     # Note: scan is a number, sample is a string!
@@ -325,6 +670,7 @@ def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
                 gp1 = mf.create_group('data')
                 # gp1_1 = mf.create_group('data/norm')
                 gp2 = mf.create_group('meta')
+                gp3 = mf.create_group('motor')
                 ##################################################
                 # Result without normalized signal!
                 for sig_key, sig in data_dict['data'].items():
@@ -352,6 +698,18 @@ def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
                         else:
                             meta_sig = np.array([meta_sig]).ravel()
                             gp2.create_dataset(meta_key, shape=(len(meta_sig), 1), data=meta_sig, dtype='float64')                                
+
+                # Motor data
+                for motor_key, motor_sig in data_dict['motor'].items():
+                    if type(motor_sig) is str:
+                        t = gp3.create_dataset(motor_key, shape=(1,), dtype=special_dtype(vlen=str))
+                        t[0] = motor_sig
+                    else:   
+                        if type(motor_sig) is np.ndarray:
+                            gp3.create_dataset(motor_key, shape=(len(motor_sig), 1), data=motor_sig, dtype='float64')
+                        else:
+                            motor_sig = np.array([motor_sig]).ravel()
+                            gp3.create_dataset(motor_key, shape=(len(motor_sig), 1), data=motor_sig, dtype='float64')
                 ##################################################                
                 mf.close()
             ####################################################################################################
@@ -362,6 +720,7 @@ def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
                 ##################################################
                 data_dict_order = {sig_key:sig for sig_key, sig in data_dict['data'].items() if sig_key[-4:]!= 'norm'} # Remove the normalized signal
                 data_dict_order.update(data_dict['meta']) # Add the meta data
+                data_dict_order.update(data_dict['motor']) # Add the motor data
 
                 ##################################################
                 mdf = pd_df.from_dict(data_dict_order) # Change the dict to a Panda dataframe
@@ -385,6 +744,7 @@ def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
                     gp1 = mf.create_group('data')
                     # gp1_1 = mf.create_group('data/norm')
                     gp2 = mf.create_group('meta')
+                    gp3 = mf.create_group('motor')
                     ##################################################
                     # Result without normalized signal!
                     for sig_key, sig in data_dict['data'].items():
@@ -411,7 +771,18 @@ def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
                                 gp2.create_dataset(meta_key, shape=(len(meta_sig), 1), data=meta_sig, dtype='float64')
                             else:
                                 meta_sig = np.array([meta_sig]).ravel()
-                                gp2.create_dataset(meta_key, shape=(len(meta_sig), 1), data=meta_sig, dtype='float64')                                
+                                gp2.create_dataset(meta_key, shape=(len(meta_sig), 1), data=meta_sig, dtype='float64')    
+                    # Motor data
+                    for motor_key, motor_sig in data_dict['motor'].items():
+                        if type(motor_sig) is str:
+                            t = gp3.create_dataset(motor_key, shape=(1,), dtype=special_dtype(vlen=str))
+                            t[0] = motor_sig
+                        else:   
+                            if type(motor_sig) is np.ndarray:
+                                gp3.create_dataset(motor_key, shape=(len(motor_sig), 1), data=motor_sig, dtype='float64')
+                            else:
+                                motor_sig = np.array([motor_sig]).ravel()
+                                gp3.create_dataset(motor_key, shape=(len(motor_sig), 1), data=motor_sig, dtype='float64')            
                     ##################################################                
                     mf.close()
                 ####################################################################################################
@@ -422,6 +793,7 @@ def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
                     ##################################################
                     data_dict_order = {sig_key:sig for sig_key, sig in data_dict['data'].items() if sig_key[-4:]!= 'norm'} # Remove the normalized signal
                     data_dict_order.update(data_dict['meta']) # Add the meta data
+                    data_dict_order.update(data_dict['motor']) # Add the motor data
 
                     ##################################################
                     mdf = pd_df.from_dict(data_dict_order) # Change the dict to a Panda dataframe
@@ -440,8 +812,8 @@ def save_scan(data, save_folder,data_format='hdf',scan=None, sample=None):
             
             
             
-            
-##############################################################################################
+
+""
 def save_map(data, save_folder, data_format='hdf'):
 
     if not os.path.exists(save_folder):
@@ -518,7 +890,7 @@ def save_map(data, save_folder, data_format='hdf'):
 
 
 
-##############################################################################################
+""
 def sig2spec(data, scan=None,
              slope_l=None, slope_r=None, points_per_pixel=None):
     if slope_l is None:
@@ -572,7 +944,7 @@ def sig2spec(data, scan=None,
     return data
 
 
-##############################################################################################
+""
 def meta_data(data, scan=None):
     ##############################################################
     # Sort the scan in order
@@ -606,7 +978,7 @@ def meta_data(data, scan=None):
     return meta_dict
 
 
-##############################################################################################
+""
 def save_data(data, save_folder, scan=None,data_format='hdf', sample=None):
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
@@ -703,9 +1075,7 @@ def save_data(data, save_folder, scan=None,data_format='hdf', sample=None):
             print('Data format is unknown!!!')
 
 
-##############################################################################################
-
-
+""
 def save_data_total(data, save_folder, data_format='hdf', sample=None):
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
@@ -805,7 +1175,7 @@ def save_data_total(data, save_folder, data_format='hdf', sample=None):
         print('Data format is unknown!!!')
 
 
-##############################################################################################
+""
 def correlate_shift(sig_x_ref, sig_ref, sig_x, sig):
     if len(sig) != len(sig_ref):
         raise ValueError("The lengths of signals for correlations are different!!!")
@@ -844,7 +1214,7 @@ def correlate_shift(sig_x_ref, sig_ref, sig_x, sig):
     return xshift
 
 
-##############################################################################################
+""
 def sig_cor(x_ref, y_ref, x, y, roi_cor=None, cor_interp=1):
     if roi_cor is None:
         roi_cor = [x_ref.min(), x_ref.max()]
@@ -867,7 +1237,8 @@ def sig_cor(x_ref, y_ref, x, y, roi_cor=None, cor_interp=1):
 
     return shift
 
-##############################################################################################
+""
+
 
 ##############################################################################################
 # Smooth function
@@ -962,7 +1333,7 @@ def m_interpolate(sig_x, sig_y, size, order=3):
     ynew = interpolate.splev(xnew, tck, der=0)
     return xnew, ynew
 
-#########################################################################################################################
+""
 def get_para(fit_params):
     # From the fitting parameters class of lmfit to get the fitting results
     # A dictionary has been returned
@@ -974,7 +1345,7 @@ def get_para(fit_params):
     para_dict = dict(zip((fit_params.valuesdict()).keys(), para_r))
     return para_dict
 
-########################################################################
+""
 def save_dict2hdf(data_folder,data_dict):
     if not os.path.exists(data_folder):
         os.makedirs(data_folder)
