@@ -21,6 +21,24 @@ from pathlib import Path
 from databroker import Broker
 db = Broker.named('six')
 
+def load_centroids_data(scanid):
+    if scanid<345840:
+        from tiled.client import from_uri
+        tiled_client = from_uri("https://tiled.nsls2.bnl.gov/")["six/raw"]
+        
+        return load_centroids_data_frame(tiled_client, scanid)
+    else:
+        from tiled.client import from_uri
+        tiled_client = from_uri("https://tiled.nsls2.bnl.gov/")["six/migration"]
+
+        # These were malformed during collection and need repair
+        if scanid in [345907, 345908]:
+            return repair_rixscam_centroid_layout(
+                read_rixscam_centroids(tiled_client, scanid)[0]
+            ), 0
+
+        return read_rixscam_centroids(tiled_client, scanid)
+
 
 ####### May 21, 2026 -- Thomas Hopkins wrote codes for loading corrupted RIXS scans #####################
 columns = ("x", "y", "x_eta", "y_eta", "y_eta_iso", "sum_regions", "XIP mode")
@@ -28,8 +46,7 @@ dtype_list = [(name, "<f4") for name in columns] + [("frame", "<i2")]
 dtype = np.dtype(dtype_list)
 LENGTH = 4800  # twice the longest we have seen (increased from 2400 in March 2023)
 
-from tiled.client import from_uri
-tiled_client = from_uri("https://tiled.nsls2.bnl.gov/")["six/raw"]
+from pathlib import Path
 
 class Handler:
     """
@@ -163,7 +180,139 @@ def load_centroids_data_frame(tiled_client, uid: str) -> pd.DataFrame:
             
     return arr, errorcount
 
-###########################################################################################################################
+########### New way to load rixscam centroiding data from tiled - Aug. 2026 ##############
+def read_rixscam_centroids(tiled_client, uid, stream_name="primary"):
+    errorcount = 0 # put arbitrary errorcount to follow the return format of the previous loading function for rixscam centroids
+    
+    import numpy
+
+    legacy_columns = (
+        "x",
+        "y",
+        "x_eta",
+        "y_eta",
+        "y_eta_iso",
+        "sum_regions",
+        "XIP mode",
+    )
+    legacy_dtype = numpy.dtype(
+        [(name, "<f4") for name in legacy_columns] + [("frame", "<i2")]
+    )
+    # legacy_length = 4800
+    legacy_length = 10000  # new length possible
+    centroid_data_keys = tuple(
+        (field, f"rixscam_centroids_{field.replace(' ', '_')}")
+        for field in legacy_columns
+    )
+
+    run = tiled_client[uid]
+    stream = run[stream_name]
+
+    columns_data = []
+    for legacy_field, data_key in centroid_data_keys:
+        value = stream[data_key].read()
+        nested = value.tolist() if hasattr(value, "tolist") else value
+        columns_data.append((legacy_field, data_key, nested))
+
+    first_column = columns_data[0][2]
+    num_points = len(first_column)
+
+    out = numpy.empty((num_points, legacy_length), dtype=legacy_dtype)
+    out.fill(-1)
+
+    for _, data_key, nested in columns_data[1:]:
+        actual = len(nested)
+        if actual != num_points:
+            raise ValueError(
+                f"Column {data_key!r} has {actual} points; expected {num_points}."
+            )
+
+    max_frame_index = numpy.iinfo(numpy.int16).max
+    for point_index in range(num_points):
+        first_frames = first_column[point_index]
+        expected_frames = len(first_frames)
+
+        for _, data_key, nested in columns_data[1:]:
+            actual = len(nested[point_index])
+            if actual != expected_frames:
+                raise ValueError(
+                    f"Column {data_key!r} has {actual} frames at point {point_index}; "
+                    f"expected {expected_frames}."
+                )
+
+        start = 0
+        for frame_index in range(expected_frames):
+            first_centroids = first_frames[frame_index]
+            expected_centroids = len(first_centroids)
+
+            for legacy_field, data_key, nested in columns_data[1:]:
+                actual = len(nested[point_index][frame_index])
+                if actual != expected_centroids:
+                    raise ValueError(
+                        f"Column {data_key!r} has {actual} centroids at point "
+                        f"{point_index} frame {frame_index}; expected "
+                        f"{expected_centroids}."
+                    )
+
+            stop = start + expected_centroids
+            if stop > legacy_length:
+                raise ValueError(
+                    f"Point {point_index} contains {stop} centroid rows, exceeding "
+                    f"padding length {legacy_length}."
+                )
+            if expected_centroids and frame_index > max_frame_index:
+                raise ValueError(
+                    f"Point {point_index} has frame index {frame_index}, "
+                    "exceeding int16 frame dtype."
+                )
+
+            out[legacy_columns[0]][point_index, start:stop] = first_centroids
+            for legacy_field, _, nested in columns_data[1:]:
+                out[legacy_field][point_index, start:stop] = nested[point_index][
+                    frame_index
+                ]
+            out["frame"][point_index, start:stop] = frame_index
+            start = stop
+
+    return out, errorcount
+
+# --- FIXES DATA FOR SCAN ID [345907, 345908] ONLY, which recorded data incorrectly ---
+# Added by Thomas Hopkins on Sep. 15, 2026
+def repair_rixscam_centroid_layout(centroids):
+    fields = (
+        "x",
+        "y",
+        "x_eta",
+        "y_eta",
+        "y_eta_iso",
+        "sum_regions",
+        "XIP mode",
+    )
+
+    repaired = np.empty_like(centroids)
+    repaired.fill(-1)
+
+    for point_index, point in enumerate(centroids):
+        write_index = 0
+        valid_frames = point["frame"][point["frame"] >= 0]
+
+        for frame_index in np.unique(valid_frames):
+            frame_mask = point["frame"] >= frame_index
+
+            # Reassemble the original row-major buffer, then interpret each
+            # seven-value row as one centroid record
+            frame_rows = np.concatenate(
+                [point[field][frame_mask] for field in fields]
+            ).reshape((-1, len(fields)))
+
+            stop = write_index + len(frame_rows)
+            for column_index, field in enumerate(fields):
+                repaired[field][point_index, write_index:stop] = frame_rows[:, column_index]
+
+            repaired["frame"][point_index, write_index:stop] = frame_index
+            write_index = stop
+    return repaired
+
 
 def structured_ragged_arrays_to_dfs(arr, invalid_val = -1.0):
     """
@@ -235,8 +384,10 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
     # meta is a array to initialize the beamline parameters for this scan    
     
     header = db[int(scan)]
+    from tiled.client import from_uri
+    tiled_client = from_uri("https://tiled.nsls2.bnl.gov/")["six/migration"][int(scan)]
+    
     data = {}
-
     # Initialize the keys for meta data
     if meta is None:
         meta = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','pgm_cff','oc_twoth','epu1_gap_readback',
@@ -264,7 +415,8 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
     # data_sheet = pd_concat([frame for frame in pdframes], ignore_index=True)  # sig in data is a pandas dataframe!
 
     # centroids_array = np.array(list(header.data('rixscam_centroids')))
-    centroids_array, num_corrupted_images = load_centroids_data_frame(tiled_client,int(scan))
+    # centroids_array, num_corrupted_images = load_centroids_data_frame(tiled_client,int(scan))
+    centroids_array, num_corrupted_images = load_centroids_data(int(scan)) # new way to load centroiding data (Aug. 2026)
     # num_corrupted_images = np.array([np.isnan(centroids_array[i][0][0]) for i in range(centroids_array.shape[0])]).sum()
     pdframes = structured_ragged_arrays_to_dfs(centroids_array)
     data_sheet = pd_concat(pdframes, ignore_index=True)
@@ -308,15 +460,19 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
     data['image_num'] = len(pdframes)-num_corrupted_images  # Number of images in this scan
     data['count_time'] = data['image_time'] * data['image_num']  # Total counting time in seconds
     # data['total_time'] = (header['stop'].get('time', time()) - header['start']['time'])  # Duration time (s) for the whole scan
-    data_timestamp = header.table()['time'].to_numpy() # unit: nano sec (1e-9 sec)
-    data['total_time'] = float((data_timestamp[-1]-data_timestamp[0])/np.timedelta64(1,'s')) # Duration time (s) for the whole scan
+    # data_timestamp = header.table()['time'].to_numpy() # unit: nano sec (1e-9 sec)
+    # data['total_time'] = float((data_timestamp[-1]-data_timestamp[0])/np.timedelta64(1,'s')) # Duration time (s) for the whole scan
+    
+    data_timestamp = tiled_client['primary']['time'][:]  
+    data['total_time'] = float(data_timestamp[-1]-data_timestamp[0])
 
     # Get the I0 for normalization
-    try:
-        I_0 = (db.get_table(header)['sclr_channels_chan8']).to_numpy()
-        data['norm_I0'] = np.delete(I_0, np.where(I_0 <= ((I_0.max() + I_0.mean()) / 2))).mean()
-    except:
-        data['norm_I0'] = 1.0
+    # try:
+    #     I_0 = (db.get_table(header)['sclr_channels_chan8']).to_numpy()
+    #     data['norm_I0'] = np.delete(I_0, np.where(I_0 <= ((I_0.max() + I_0.mean()) / 2))).mean()
+    # except:
+    #     data['norm_I0'] = 1.0
+    data['norm_I0'] = 1.0
     data['norm_I0']/=data['image_time']
         
     scan_start_time = ctime(header['start']['time'])
@@ -327,157 +483,6 @@ def rixs_data(scan, sig_x='x_eta', sig_y='y_eta', meta=None):
     print('--- duration {:.1f}s --- when {}'.format(data['total_time'], scan_start_time))
 
     return data
-
-# def six_data_corrupted(scan, corr_scan, date, filepath, filename, index, meta=None,E_cali=21.77):
-#     if meta is None:
-#         meta = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','oc_twoth','epu1_gap_readback',
-#                          'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
-#     else:
-#         meta_ = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','oc_twoth','epu1_gap_readback',
-#                           'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
-#         meta = np.unique(np.hstack((meta, meta_)))        
-#     data = {}
-#     for i,n in enumerate(scan):
-#         if n not in corr_scan:
-#             data['six-' + str(n)] = rixs_data(n, meta=meta)
-#         else:
-#             data['six-' + str(n)] = rixs_data_corrupted(n, date, filepath, filename, index, meta=meta)
-#             print(f"Corrupted RIXS scan:{n}, Apr. {date:02d}")
-#         ################################################
-#         # Correct the pixel shift due to different incident photon energies
-#         data['six-' + str(n)]['E_cali'] = E_cali
-#         if i==0:
-#             energy_ref = data['six-' + str(n)]['energy']
-#         energy_offset = (data['six-' + str(n)]['energy'] - energy_ref)*1000 # in the unit of meV
-#         if np.abs(energy_offset)>100.0:
-#             data['six-' + str(n)]['sig_y']+=(energy_offset/E_cali)
-#         else:
-#             pass
-#     #################################################################### 
-#     return data
-
-
-# ""
-# def rixs_data_corrupted(scan, date, filepath, filename, index, sig_x='x_eta', sig_y='y_eta', meta=None):
-#     """This is for extracting the RIXS data from BNL online drive """
-#     """The result is a dict containing the 1-dimensional signal and interesting beamline parameters"""
-#     """The version of reading rixs_scan that is corrupted -- 0 Byte file included"""
-#     # sig_x and sig_y characterize the signal type (COM or corrected COM) provided by (Xcam) detector.
-#     # They can be x or x_eta, y or y_eta.
-    
-#     # meta is a array to initialize the beamline parameters for this scan    
-    
-#     header = db[int(scan)]
-#     data = {}
-
-#     # Initialize the keys for meta data
-#     if meta is None:
-#         meta = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','pgm_cff','oc_twoth','epu1_gap_readback',
-#                          'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
-#     else:
-#         meta_ = np.array(['cryo_x', 'cryo_y', 'cryo_z', 'cryo_t', 'pgm_en','oc_twoth', 'epu1_gap_readback',
-#                           'stemp_temp_B_T','stemp_temp_A_T', 'epu1_phase_readback', 'extslt_vg', 'extslt_hg', 'ring_curr']) # 
-#         meta = np.unique(np.hstack((meta, meta_)))
-#     meta_name = {'cryo_x': 'x', 'cryo_y': 'y', 'cryo_z': 'z', 'cryo_t': 'th', 'pgm_en': 'energy',
-#                  'stemp_temp_B_T': 'T','stemp_temp_A_T':'T_cryo',
-#                  'epu1_phase_readback': 'pol','epu1_gap_readback': 'pol_gap','pgm_cff':'cff','oc_twoth': 'tth', 
-#                  'extslt_vg': 'slit_v', 'extslt_hg': 'slit_h', 'ring_curr': 'ring_curr'} # 
-
-#     #######################################################################
-#     # get the image dimensions
-#     img_size_x = int(header.config_data('rixscam')['primary'][0].get('rixscam_sensor_region_xsize')*2)
-#     img_size_y = int(header.config_data('rixscam')['primary'][0].get('rixscam_sensor_region_ysize'))
-#     data['image_size'] = np.array([img_size_x,img_size_y])
-    
-#     #######################################################################
-#     # Extract the 1-D signal
-#     # centroids = list(header.data('rixscam_centroids'))
-#     # # pdframes = [centroid for centroid in centroids[0]]
-#     # pdframes = [sub_centroid for centroid in centroids for sub_centroid in centroid]
-#     # data_sheet = pd_concat([frame for frame in pdframes], ignore_index=True)  # sig in data is a pandas dataframe!
-
-#     # centroids_array = np.array(list(header.data('rixscam_centroids')))
-#     # pdframes = structured_ragged_arrays_to_dfs(centroids_array)
-#     # data_sheet = pd_concat(pdframes, ignore_index=True)
-
-#     dirpath = filepath+f'{date:02d}/'
-    
-#     # Match any file containing "partial" in its name
-#     files = Path(dirpath).glob(f'{filename}*.h5')
-#     fpaths = sorted([f.name for f in files if f.is_file()])
-#     for i in sorted(index, reverse=True):
-#         del fpaths[i]
-        
-#     dt = np.dtype([('x', '<f4'), ('y', '<f4'), ('x_eta', '<f4'), ('y_eta', '<f4'),
-#                    ('y_eta_iso', '<f4'), ('sum_regions', '<f4'), ('XIP mode', '<f4'), ('frame', '<i2')])
-#     centroids_array = []
-#     for fp in fpaths:
-#         a = h5py.File(dirpath+fp)['/entry/data/data'][()]
-#         b = np.hstack((a,np.zeros((a.shape[0],1))))
-#         structured_arrs = rfn.unstructured_to_structured(b, dtype=dt)
-#         centroids_array.append(structured_arrs)
-    
-#     pdframes = [pd.DataFrame(centroids_array_each) for centroids_array_each in centroids_array]
-#     data_sheet = pd_concat(pdframes, ignore_index=True)
-
-#     data['sig_x'] = data_sheet[sig_x].to_numpy()
-#     data['sig_y'] = data_sheet[sig_y].to_numpy()
-
-#     #######################################################################
-#     # shift the signal from right sensor by -26 pixels
-#     data['sig_y'][data['sig_x']>(img_size_x/2)]-=26
-#     #######################################################################
-#     meta_list = []
-#     for i in db.get_table(header, stream_name="baseline").columns:
-#         meta_list.append(i)
-        
-#     # Extract the meta-data
-#     for key in (meta):
-#         if key in meta_list:
-#             vari = db.get_table(header, stream_name="baseline", fields=[key])[key]
-#             if key in meta_name.keys():
-#                 if key == 'epu1_phase_readback':
-#                     pol_val = vari.mean(axis=0)
-#                     if np.abs(pol_val - 0) < (1e-2):
-#                         data[meta_name[key]] = 'LH'
-#                     elif np.abs(pol_val - 28.5) < (1e-2):
-#                         data[meta_name[key]] = 'LV'
-#                     else:
-#                         data[meta_name[key]] = vari.mean(axis=0)
-#                 else:
-#                     data[meta_name[key]] = vari.mean(axis=0)
-#             else:
-#                 data[key] = vari.mean(axis=0)
-#         else:
-#             if key in meta_name.keys():
-#                 data[meta_name[key]] = 'N/A'
-#             else:
-#                 data[key] = 'N/A'
-
-#     # Specific the counting time for this scan
-#     data['image_time'] = header.config_data('rixscam')['primary'][0].get('rixscam_cam_acquire_time')  # expose time (seconds) for one image
-#     data['image_num'] = len(pdframes)  # Number of images in this scan
-#     data['count_time'] = data['image_time'] * data['image_num']  # Total counting time in seconds
-#     # data['total_time'] = (header['stop'].get('time', time()) - header['start']['time'])  # Duration time (s) for the whole scan
-#     data_timestamp = header.table()['time'].to_numpy() # unit: nano sec (1e-9 sec)
-#     data['total_time'] = float((data_timestamp[-1]-data_timestamp[0])/np.timedelta64(1,'s')) # Duration time (s) for the whole scan
-
-#     # Get the I0 for normalization
-#     try:
-#         I_0 = (db.get_table(header)['sclr_channels_chan8']).to_numpy()
-#         data['norm_I0'] = np.delete(I_0, np.where(I_0 <= ((I_0.max() + I_0.mean()) / 2))).mean()
-#     except:
-#         data['norm_I0'] = 1.0
-#     data['norm_I0']/=data['image_time']
-        
-#     scan_start_time = ctime(header['start']['time'])
-
-#     # Print out the details for each scan
-#     print('--- six-{} --- points {} --- '.format(scan, data['image_num']), end='')
-#     print('split time {}s --- total {}s '.format(data['image_time'], data['count_time']), end='')
-#     print('--- duration {:.1f}s --- when {}'.format(data['total_time'], scan_start_time))
-
-#     return data
 
 def print_data(data, scan=None):
     data_table = PrettyTable()
